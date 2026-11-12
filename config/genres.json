@@ -1,0 +1,22 @@
+[
+  { "slug": "bookshelf",   "name": "絵本",                 "genreId": 200162, "enabled": true },
+  { "slug": "childcare",   "name": "ベビー・育児",         "genreId": 100533, "enabled": true },
+  { "slug": "mensfashion", "name": "メンズファッション",   "genreId": 551177, "enabled": true },
+  { "slug": "ldyfashion",  "name": "レディースファッション", "genreId": 100371, "enabled": true },
+  { "slug": "shoes",       "name": "シューズ",             "genreId": 558885, "enabled": true },
+  { "slug": "bag",         "name": "バッグ",               "genreId": 216131, "enabled": true },
+  { "slug": "accessory",   "name": "アクセサリー",         "genreId": 216129, "enabled": true },
+  { "slug": "gourmet",     "name": "グルメ",               "genreId": 100227, "enabled": true },
+  { "slug": "games",       "name": "ゲーム",               "genreId": 101205, "enabled": true },
+  { "slug": "pcgadget",    "name": "PC・ガジェット",       "genreId": 100026, "enabled": true },
+  { "slug": "homeapp",     "name": "家電",                 "genreId": 562637, "enabled": true },
+  { "slug": "pet",         "name": "ペット",               "genreId": 101213, "enabled": true },
+  { "slug": "beautycosme", "name": "美容・コスメ",         "genreId": 100939, "enabled": true },
+  { "slug": "underwear",   "name": "インナー",             "genreId": 100433, "enabled": true },
+  { "slug": "furniture",   "name": "家具",                 "genreId": 100804, "enabled": true },
+  { "slug": "kitchen",     "name": "キッチン",             "genreId": 558944, "enabled": true },
+  { "slug": "sweets",      "name": "スイーツ",             "genreId": 551167, "enabled": false },
+  { "slug": "diet",        "name": "ダイエット",           "genreId": 100938, "enabled": false },
+  { "slug": "smartphone",  "name": "スマホ",               "genreId": 564500, "enabled": false },
+  { "slug": "hobby",       "name": "ホビー",               "genreId": 566382, "enabled": false }
+]
