@@ -1,8 +1,8 @@
 {
   "name": "楽天デイリーランキング",
   "description": "楽天市場のジャンル別リアルタイムランキングを毎日更新。順位の変動や急上昇商品がひと目で分かります。",
-  "baseUrl": "https://haraguchinaoki-tech.github.io/rakuten-ranking",
-  "allowedOrigin": "https://haraguchinaoki-tech.github.io",
+  "baseUrl": "https://nokes21.github.io/rakuten-ranking",
+  "allowedOrigin": "https://nokes21.github.io",
   "affiliateId": "55c89ea4.29b98f70.55c89ea5.eb2be847",
   "topN": 30
 }

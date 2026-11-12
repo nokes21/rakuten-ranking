@@ -22,10 +22,10 @@ GitHub Actions (毎日 05:30 JST)
    Settings → Pages → Build and deployment → Source を **GitHub Actions** にする
 3. **初回実行**
    Actions タブ → "Update ranking and deploy" → Run workflow
-4. 数分後、`https://haraguchinaoki-tech.github.io/rakuten-ranking/` に公開されます
+4. 数分後、`https://nokes21.github.io/rakuten-ranking/` に公開されます
 
 楽天ウェブサービス側のアプリ設定では、「WebサイトURL(許可されたWebサイト)」に
-`https://haraguchinaoki-tech.github.io/` を登録してください(2026年の仕様変更で必須です)。
+`https://nokes21.github.io/` を登録してください(2026年の仕様変更で必須です)。
 
 ## 設定ファイル
 
