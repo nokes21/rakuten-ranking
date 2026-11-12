@@ -182,9 +182,18 @@ ${body}
 }
 
 function nav(current) {
-  const links = genres.map((g) =>
-    `<a class="chip${g.slug === current ? ' on' : ''}" href="${current === null ? '' : '../'}${g.slug}/">${esc(g.name)}</a>`);
-  return `<nav class="chips">${links.join('')}</nav>`;
+  const prefix = current === null ? '' : '../';
+  const chip = (g) =>
+    `<a class="chip${g.slug === current ? ' on' : ''}" href="${prefix}${g.slug}/">${esc(g.name)}</a>`;
+  if (current === null) {
+    const groups = [...new Set(genres.map((g) => g.group))];
+    return groups.map((gr) =>
+      `<div class="grp"><span class="grp-name">${esc(gr)}</span><nav class="chips">${
+        genres.filter((g) => g.group === gr).map(chip).join('')}</nav></div>`).join('');
+  }
+  const cur = genres.find((g) => g.slug === current);
+  return `<nav class="chips"><a class="chip" href="../">すべてのジャンル</a>${
+    genres.filter((g) => g.group === cur.group).map(chip).join('')}</nav>`;
 }
 
 function deltaBadge(it) {
@@ -227,6 +236,7 @@ a{color:inherit}.wrap{max-width:860px;margin:0 auto;padding:0 16px}
 h1{font-size:22px;margin:24px 0 4px}h2{font-size:17px;margin:32px 0 10px;border-left:4px solid var(--red);padding-left:10px}
 .lead{color:var(--sub);margin:0 0 16px;font-size:13px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.chip{background:#fff;border:1px solid var(--line);border-radius:999px;padding:4px 12px;font-size:13px;text-decoration:none}.chip.on{background:var(--red);color:#fff;border-color:var(--red)}
+.grp{margin:8px 0}.grp-name{font-size:12px;color:var(--sub);font-weight:600}.grp .chips{margin:4px 0 8px}
 .list{list-style:none;margin:0;padding:0;display:grid;gap:10px}
 .item{display:grid;grid-template-columns:56px 120px 1fr;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;align-items:start}
 .item.norank{grid-template-columns:120px 1fr}
