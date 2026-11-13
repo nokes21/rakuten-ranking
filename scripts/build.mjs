@@ -12,8 +12,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DIST = path.join(ROOT, 'dist');
-const DATA = path.join(ROOT, 'data');
+const DIST = process.env.DIST_DIR ? path.resolve(process.env.DIST_DIR) : path.join(ROOT, 'dist');
+const DATA = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, 'data');
 const ENDPOINT = 'https://openapi.rakuten.co.jp/ichibaranking/api/IchibaItem/Ranking/20220601';
 
 const site = JSON.parse(await readFile(path.join(ROOT, 'config/site.json'), 'utf8'));
@@ -104,25 +104,50 @@ async function fetchRanking(genre) {
   throw new Error('リトライ上限');
 }
 
-// 動作確認用のダミーデータ
+// 動作確認用のダミーデータ(MOCK=1 のときだけ使用)
+// 商品は固定の人気度を持ち、日ごとに少しだけ揺らぐ。順位の入れ替わり・新着・価格変動が自然に出る。
+function hash01(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  h ^= h >>> 13; h = Math.imul(h, 0x5bd1e995); h ^= h >>> 15;
+  return (h >>> 0) / 4294967296;
+}
+const MOCK_POOL = 42;
+const MOCK_WORDS = ['送料無料', 'ポイント10倍', '選べる', '大容量', '訳あり', '2個セット', '日本製', '公式', '期間限定', 'まとめ買い'];
+const MOCK_COLORS = ['#e8c4c4', '#c4d8e8', '#d6e8c4', '#e8dfc4', '#d8c4e8', '#c4e8e3', '#e8cfc4', '#c4c8e8'];
+function mockImage(label, n) {
+  const bg = MOCK_COLORS[n % MOCK_COLORS.length];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="200" height="200" fill="${bg}"/>` +
+    `<text x="100" y="96" font-size="18" text-anchor="middle" fill="#555" font-family="sans-serif">SAMPLE</text>` +
+    `<text x="100" y="124" font-size="13" text-anchor="middle" fill="#777" font-family="sans-serif">${label.slice(0, 8)}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
 function mockRanking(genre) {
-  const seed = [...TODAY].reduce((a, c) => a + c.charCodeAt(0), 0);
-  const order = Array.from({ length: site.topN }, (_, i) => i + 1);
-  // 日付ごとに順位をシャッフルして順位変動を再現
-  order.sort((a, b) => ((a * 7919 + seed * genre.genreId) % 101) - ((b * 7919 + seed * genre.genreId) % 101));
-  return order.map((n, idx) => ({
+  const pool = Array.from({ length: MOCK_POOL }, (_, i) => {
+    const n = i + 1;
+    const key = `${genre.slug}:${n}`;
+    const base = hash01(`pop:${key}`);                       // 固定の人気度
+    const swing = hash01(`d:${TODAY}:${key}`) - 0.5;        // 日ごとの揺らぎ
+    const roll = hash01(`p:${TODAY}:${key}`);
+    const priceBase = 800 + Math.round(hash01(`pr:${key}`) * 9000 / 10) * 10;
+    const priceFactor = roll < 0.14 ? 0.88 : roll < 0.2 ? 1.06 : 1; // 値下げ14%・値上げ6%
+    return { n, key, score: base + swing * 0.35, priceBase, priceFactor };
+  });
+  pool.sort((a, b) => b.score - a.score);
+  const word = (n) => MOCK_WORDS[n % MOCK_WORDS.length];
+  return pool.slice(0, site.topN).map((p, idx) => ({
     rank: idx + 1,
-    code: `mock-${genre.slug}:${n}`,
-    name: `【サンプル】${genre.name}の人気商品 ${n} 送料無料 ポイント5倍 テスト用ダミー商品名です`,
-    price: 1000 + n * 137 + ((seed + n) % 5) * 50,
-    url: `https://item.rakuten.co.jp/example/${n}/`,
-    aff: `https://hb.afl.rakuten.co.jp/ichiba/${AFFILIATE_ID}/?pc=https%3A%2F%2Fitem.rakuten.co.jp%2Fexample%2F${n}%2F`,
-    img: '',
-    review: 3.5 + ((n * 13) % 15) / 10,
-    reviewCount: 10 + n * 37,
-    shop: `サンプルショップ${n}`,
-    freeShipping: n % 3 !== 0,
-    pointRate: 1,
+    code: `mock-${genre.slug}:${p.n}`,
+    name: `【${word(p.n)}】${genre.name}の人気アイテム No.${p.n} ${word(p.n + 3)} ${word(p.n + 5)} サンプル商品名がここに入ります`,
+    price: Math.round((p.priceBase * p.priceFactor) / 10) * 10,
+    url: `https://item.rakuten.co.jp/example/${p.n}/`,
+    aff: `https://hb.afl.rakuten.co.jp/ichiba/${AFFILIATE_ID}/?pc=https%3A%2F%2Fitem.rakuten.co.jp%2Fexample%2F${p.n}%2F`,
+    img: mockImage(genre.name, p.n),
+    review: Math.round((3.6 + hash01(`rv:${p.key}`) * 1.3) * 100) / 100,
+    reviewCount: Math.round(5 + hash01(`rc:${p.key}`) * 3000),
+    shop: `サンプルショップ${(p.n % 9) + 1}`,
+    freeShipping: hash01(`fs:${p.key}`) > 0.3,
+    pointRate: hash01(`pt:${p.key}`) > 0.75 ? 5 : 1,
   }));
 }
 
@@ -354,8 +379,6 @@ function sparkline(it) {
 
 function reasonTags(it, label) {
   const t = [];
-  if (it.isNew) t.push('<span class="tag hot">NEW</span>');
-  if (it.delta >= 5) t.push(`<span class="tag hot">${esc(label)}から▲${it.delta}</span>`);
   if (it.priceDiff < 0) t.push('<span class="tag sale">値下がり</span>');
   if (it.streak >= 3) t.push(`<span class="tag">${it.streak}日連続ランクイン</span>`);
   return t.join('');
@@ -433,7 +456,7 @@ h1{font-size:22px;margin:24px 0 4px}h2{font-size:17px;margin:32px 0 10px;border-
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.panel{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px}.panel h3{margin:0 0 6px;font-size:15px}.panel a.more{font-size:12px}
 .panel ol{margin:0;padding-left:1.4em;font-size:13px}.panel li{margin:2px 0}
 .footer{margin-top:40px;border-top:1px solid var(--line);padding:16px 0 40px;font-size:12px;color:var(--sub)}
-@media(max-width:560px){.item{grid-template-columns:44px 88px 1fr;gap:8px;padding:10px}.item.norank{grid-template-columns:88px 1fr}.thumb{width:88px;height:88px}.price{font-size:16px}}
+@media(max-width:560px){h1{font-size:19px}.item{grid-template-columns:44px 88px 1fr;gap:8px;padding:10px}.item.norank{grid-template-columns:88px 1fr}.thumb{width:88px;height:88px}.price{font-size:16px}}
 `;
 
 // ---------------------------------------------------------------- メイン
@@ -551,7 +574,7 @@ ${moverHtml}
       ? '<p class="note">順位の変動・価格の変化・7日間の推移は、データが溜まる2日目以降に表示されます。</p>' : '';
 
     const body = `<h1>楽天市場 ${esc(g.name)}ランキング</h1>
-<p class="lead">${esc(g.name)}ジャンルのリアルタイムランキング TOP${items.length}。${esc(dateLabel)}${stale ? '時点のデータです。' : `(${esc(NOW_LABEL)})に更新しました。`}</p>
+<p class="lead">${esc(g.name)}ジャンルのリアルタイムランキング TOP${items.length}。${stale ? `${esc(dateLabel)}時点のデータです。` : `${esc(NOW_LABEL)} に更新しました。`}</p>
 ${staleBanner}${histNote}
 ${sameGroupNav(g.slug)}
 <h2>${stale ? '注目商品' : '今日の注目商品'} TOP${Math.min(5, items.length)}</h2>
