@@ -139,16 +139,138 @@ async function loadHistory(date) {
   return JSON.parse(await readFile(path.join(DATA, 'history', `${date}.json`), 'utf8'));
 }
 
+
+const addDays = (dateStr, n) => {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const fmtMD = (dateStr) => `${Number(dateStr.slice(5, 7))}/${Number(dateStr.slice(8, 10))}`;
+
+const TREND_DAYS = 7;       // 順位推移の表示日数
+const HISTORY_DAYS = 30;    // 連続ランクイン日数の計算に使う履歴の最大日数
+const RAW_KEYS = ['rank', 'code', 'name', 'price', 'url', 'aff', 'img',
+  'review', 'reviewCount', 'shop', 'freeShipping', 'pointRate'];
+const toRaw = (it) => Object.fromEntries(RAW_KEYS.map((k) => [k, it[k]]));
+
+// ---------------------------------------------------------------- 履歴の分析
+
+// 履歴ファイルを読み込み、date -> slug -> (code -> {r, p}) の索引にする
+async function buildHistoryIndex() {
+  const from = addDays(TODAY, -(HISTORY_DAYS - 1));
+  const dates = (await loadHistoryDates()).filter((d) => d < TODAY && d >= from);
+  const idx = new Map();
+  for (const d of dates) {
+    const h = await loadHistory(d);
+    const bySlug = new Map();
+    for (const [slug, rows] of Object.entries(h.genres ?? {})) {
+      bySlug.set(slug, new Map(rows.map(([c, r, p]) => [c, { r, p }])));
+    }
+    idx.set(d, bySlug);
+  }
+  return { idx, dates };
+}
+
+// 1ジャンル分の商品に、前日比・7日推移・連続ランクイン日数などを付与する
+function enrich(slug, items, hist) {
+  const meta = { prevDate: null, prevLabel: '', hasPrev: false };
+  const prevDate = [...hist.dates].reverse().find((d) => hist.idx.get(d)?.has(slug));
+  let prevMap = null;
+  if (prevDate) {
+    prevMap = hist.idx.get(prevDate).get(slug);
+    meta.prevDate = prevDate;
+    meta.hasPrev = true;
+    meta.prevLabel = prevDate === addDays(TODAY, -1) ? '前日' : `${fmtMD(prevDate)}`;
+  }
+  const trendDates = Array.from({ length: TREND_DAYS }, (_, i) => addDays(TODAY, i - (TREND_DAYS - 1)));
+
+  for (const it of items) {
+    const p = prevMap?.get(it.code);
+    it.isNew = Boolean(prevMap) && !p;
+    it.delta = p ? p.r - it.rank : 0;
+    it.priceDiff = p && p.p ? it.price - p.p : 0;
+
+    it.series = trendDates.map((d) =>
+      (d === TODAY ? it.rank : hist.idx.get(d)?.get(slug)?.get(it.code)?.r ?? null));
+    const seen = it.series.filter((v) => v !== null);
+    it.best7 = Math.min(...seen);
+    const firstSeen = it.series.find((v) => v !== null);
+    it.weekDelta = seen.length >= 2 ? firstSeen - it.rank : 0; // 正=この1週間で上昇
+
+    let streak = 1;
+    for (let k = 1; k < HISTORY_DAYS; k++) {
+      if (hist.idx.get(addDays(TODAY, -k))?.get(slug)?.has(it.code)) streak++;
+      else break;
+    }
+    it.streak = streak;
+  }
+  return meta;
+}
+
+// 取得失敗で前回データを使う場合は、変動系の値を付けない(古い値を現在のように見せない)
+function markStale(items) {
+  for (const it of items) {
+    Object.assign(it, { isNew: false, delta: 0, priceDiff: 0, series: [], best7: it.rank, weekDelta: 0, streak: 1 });
+  }
+}
+
+const median = (arr) => {
+  const a = [...arr].sort((x, y) => x - y);
+  return a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : 0;
+};
+
+// 注目商品: 順位・急上昇・新着・値下げ・連続ランクインを加味したスコア上位
+function pickHighlights(items, n = 5) {
+  const score = (it) => (31 - it.rank)
+    + 2 * Math.max(it.delta, 0) + (it.isNew ? 8 : 0) + (it.priceDiff < 0 ? 5 : 0) + Math.min(it.streak - 1, 5);
+  return [...items].sort((a, b) => score(b) - score(a) || a.rank - b.rank).slice(0, n);
+}
+const pickRising = (items, min = 5, n = 5) =>
+  items.filter((i) => i.delta >= min).sort((a, b) => b.delta - a.delta || a.rank - b.rank).slice(0, n);
+const pickNew = (items, n = 5) => items.filter((i) => i.isNew).sort((a, b) => a.rank - b.rank).slice(0, n);
+const pickCuts = (items, n = 5) => items.filter((i) => i.priceDiff < 0 && i.price - i.priceDiff > 0)
+  .sort((a, b) => a.priceDiff / (a.price - a.priceDiff) - b.priceDiff / (b.price - b.priceDiff)).slice(0, n);
+
+// ジャンルの傾向(データから機械的に作る事実ベースの文章)
+function trendText(g, items, meta, stale) {
+  const prices = items.map((i) => i.price).filter((p) => p > 0);
+  const free = items.filter((i) => i.freeShipping).length;
+  const reviewed = items.filter((i) => i.reviewCount > 0);
+  const avgReview = reviewed.length ? reviewed.reduce((s, i) => s + i.review, 0) / reviewed.length : 0;
+  const shopCount = new Map();
+  for (const i of items) shopCount.set(i.shop, (shopCount.get(i.shop) ?? 0) + 1);
+  const [topShop, topShopN] = [...shopCount.entries()].sort((a, b) => b[1] - a[1])[0] ?? ['', 0];
+
+  const parts = [];
+  if (prices.length) {
+    parts.push(`TOP${items.length}の価格の中央値は${yen(Math.round(median(prices)))}、価格帯は${yen(Math.min(...prices))}〜${yen(Math.max(...prices))}です。`);
+  }
+  parts.push(`送料無料の商品は${free}件(${Math.round((free / items.length) * 100)}%)${avgReview ? `、レビュー平均は${avgReview.toFixed(2)}` : ''}です。`);
+  if (topShopN >= 3) parts.push(`「${topShop}」の商品が${topShopN}件ランクインしています。`);
+  if (!stale && meta.hasPrev) {
+    const up = items.filter((i) => i.delta >= 5).length;
+    const nw = items.filter((i) => i.isNew).length;
+    const cut = items.filter((i) => i.priceDiff < 0).length;
+    parts.push(`${meta.prevLabel}から新しくランクインしたのは${nw}件、5位以上順位を上げたのは${up}件、価格が下がったのは${cut}件でした。`);
+  }
+  return parts.join('');
+}
+
 // ---------------------------------------------------------------- HTML
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const yen = (n) => `${Number(n).toLocaleString('ja-JP')}円`;
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
-const bigImg = (u) => (u ? u.replace(/_ex=\d+x\d+/, '_ex=200x200') : '');
+const sized = (u, px) => (u ? u.replace(/_ex=\d+x\d+/, `_ex=${px}x${px}`) : '');
+const AFF_REL = 'nofollow sponsored noopener';
 
 function layout({ title, description, canonical, depth, body, jsonLd }) {
   const root = depth === 0 ? './' : '../'.repeat(depth);
+  const verify = site.googleSiteVerification
+    ? `<meta name="google-site-verification" content="${esc(site.googleSiteVerification)}">` : '';
+  const ld = (jsonLd ?? []).map((j) =>
+    `<script type="application/ld+json">${JSON.stringify(j).replace(/</g, '\\u003c')}</script>`).join('\n');
   return `<!doctype html>
 <html lang="ja">
 <head>
@@ -157,12 +279,13 @@ function layout({ title, description, canonical, depth, body, jsonLd }) {
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(description)}">
 <link rel="canonical" href="${esc(canonical)}">
+${verify}
 <meta property="og:type" content="website">
 <meta property="og:title" content="${esc(title)}">
 <meta property="og:description" content="${esc(description)}">
 <meta property="og:url" content="${esc(canonical)}">
 <link rel="stylesheet" href="${root}style.css">
-${jsonLd ? `<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g, '\\u003c')}</script>` : ''}
+${ld}
 </head>
 <body>
 <div class="pr-bar">【PR】当サイトは楽天アフィリエイトを利用しています。リンク経由でのご購入により、運営者に報酬が発生する場合があります。</div>
@@ -173,7 +296,7 @@ ${jsonLd ? `<script type="application/ld+json">${JSON.stringify(jsonLd).replace(
 ${body}
 </main>
 <footer class="footer"><div class="wrap">
-  <p>順位・価格・在庫は取得時点(${esc(NOW_LABEL)} 更新)の情報です。最新の情報は必ず楽天市場の商品ページでご確認ください。</p>
+  <p>順位・価格・在庫は各ページ記載の更新日時時点の情報です。購入前に、必ず楽天市場の商品ページで最新の価格・在庫・送料をご確認ください。リンク先は楽天市場の商品ページです。</p>
   <p><a href="https://webservice.rakuten.co.jp/" target="_blank" rel="noopener">Supported by Rakuten Developers</a></p>
 </div></footer>
 </body>
@@ -181,50 +304,98 @@ ${body}
 `;
 }
 
-function nav(current) {
-  const prefix = current === null ? '' : '../';
-  const chip = (g) =>
-    `<a class="chip${g.slug === current ? ' on' : ''}" href="${prefix}${g.slug}/">${esc(g.name)}</a>`;
-  if (current === null) {
-    const groups = [...new Set(genres.map((g) => g.group))];
-    return groups.map((gr) =>
-      `<div class="grp"><span class="grp-name">${esc(gr)}</span><nav class="chips">${
-        genres.filter((g) => g.group === gr).map(chip).join('')}</nav></div>`).join('');
-  }
+function chip(prefix, current, g) {
+  return `<a class="chip${g.slug === current ? ' on' : ''}" href="${prefix}${g.slug}/">${esc(g.name)}</a>`;
+}
+
+// 全ジャンルをグループ別に並べたナビ(内部リンク用)
+function allGenresNav(prefix, current = null) {
+  const groups = [...new Set(genres.map((g) => g.group))];
+  return groups.map((gr) =>
+    `<div class="grp"><span class="grp-name">${esc(gr)}</span><nav class="chips">${
+      genres.filter((g) => g.group === gr).map((g) => chip(prefix, current, g)).join('')}</nav></div>`).join('');
+}
+
+function sameGroupNav(current) {
   const cur = genres.find((g) => g.slug === current);
   return `<nav class="chips"><a class="chip" href="../">すべてのジャンル</a>${
-    genres.filter((g) => g.group === cur.group).map(chip).join('')}</nav>`;
+    genres.filter((g) => g.group === cur.group).map((g) => chip('../', current, g)).join('')}</nav>`;
 }
 
 function deltaBadge(it) {
   if (it.isNew) return '<span class="delta new">NEW</span>';
   if (it.delta > 0) return `<span class="delta up">▲${it.delta}</span>`;
   if (it.delta < 0) return `<span class="delta down">▼${-it.delta}</span>`;
-  return it.hasPrev ? '<span class="delta flat">→</span>' : '';
+  return it.series.length ? '<span class="delta flat">→</span>' : '';
 }
 
-function priceNote(it) {
+function priceNote(it, label) {
   if (!it.priceDiff) return '';
   const cls = it.priceDiff < 0 ? 'cut' : 'rise';
   const sign = it.priceDiff < 0 ? '↓' : '↑';
-  return `<span class="pdiff ${cls}">前日比 ${sign}${yen(Math.abs(it.priceDiff))}</span>`;
+  return `<span class="pdiff ${cls}">${esc(label)}比 ${sign}${yen(Math.abs(it.priceDiff))}</span>`;
 }
 
-function card(it, { showRank = true } = {}) {
+// 直近7日の順位推移(小さな折れ線。上ほど上位)
+function sparkline(it) {
+  const pts = it.series.map((v, i) => (v === null ? null : { i, v })).filter(Boolean);
+  if (pts.length < 2) return '';
+  const W = 76, H = 24, pad = 3;
+  const vs = pts.map((p) => p.v);
+  const lo = Math.min(...vs), hi = Math.max(...vs);
+  const x = (i) => pad + (i * (W - pad * 2)) / (TREND_DAYS - 1);
+  const y = (v) => (hi === lo ? H / 2 : pad + ((v - lo) * (H - pad * 2)) / (hi - lo));
+  const line = pts.map((p) => `${x(p.i).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ');
+  const last = pts[pts.length - 1];
+  const dir = it.weekDelta > 0 ? 'up' : it.weekDelta < 0 ? 'down' : 'flat';
+  const label = `直近${TREND_DAYS}日の順位推移(最高${it.best7}位)`;
+  return `<svg class="spark ${dir}" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(label)}"><polyline points="${line}" fill="none" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/><circle cx="${x(last.i).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="2.4"/></svg>`;
+}
+
+function reasonTags(it, label) {
+  const t = [];
+  if (it.isNew) t.push('<span class="tag hot">NEW</span>');
+  if (it.delta >= 5) t.push(`<span class="tag hot">${esc(label)}から▲${it.delta}</span>`);
+  if (it.priceDiff < 0) t.push('<span class="tag sale">値下がり</span>');
+  if (it.streak >= 3) t.push(`<span class="tag">${it.streak}日連続ランクイン</span>`);
+  return t.join('');
+}
+
+function card(it, { showRank = true, prevLabel = '前日', sub = '' } = {}) {
   const href = it.aff || it.url;
-  const img = bigImg(it.img);
+  const img = sized(it.img, 200);
   const stars = it.reviewCount > 0
     ? `<span class="review">★${it.review.toFixed(2)} <small>(${it.reviewCount.toLocaleString('ja-JP')}件)</small></span>` : '';
+  const spark = sparkline(it);
+  const trend = it.series.length && it.best7 < it.rank
+    ? `<span class="best">直近${TREND_DAYS}日の最高 ${it.best7}位</span>` : '';
   return `<li class="item${showRank ? '' : ' norank'}">
   ${showRank ? `<div class="rank r${Math.min(it.rank, 4)}"><b>${it.rank}</b>位${deltaBadge(it)}</div>` : ''}
-  <a class="thumb" href="${esc(href)}" target="_blank" rel="nofollow sponsored noopener">${img ? `<img src="${esc(img)}" alt="" loading="lazy" width="120" height="120">` : '<span class="noimg">No Image</span>'}</a>
+  <a class="thumb" href="${esc(href)}" target="_blank" rel="${AFF_REL}">${img ? `<img src="${esc(img)}" alt="${esc(clip(it.name, 40))}" loading="lazy" width="120" height="120">` : '<span class="noimg">No Image</span>'}</a>
   <div class="info">
-    <a class="name" href="${esc(href)}" target="_blank" rel="nofollow sponsored noopener">${esc(clip(it.name, 70))}</a>
-    <div class="price">${yen(it.price)}${priceNote(it)}</div>
+    <a class="name" href="${esc(href)}" target="_blank" rel="${AFF_REL}">${esc(clip(it.name, 70))}</a>
+    <div class="price">${yen(it.price)}${priceNote(it, prevLabel)}</div>
     <div class="meta">${stars}${it.freeShipping ? '<span class="tag">送料無料</span>' : ''}${it.pointRate > 1 ? `<span class="tag">ポイント${it.pointRate}倍</span>` : ''}<span class="shop">${esc(it.shop)}</span></div>
-    <a class="btn" href="${esc(href)}" target="_blank" rel="nofollow sponsored noopener">楽天市場で見る</a>
+    ${sub}${reasonTags(it, prevLabel) ? `<div class="tags">${reasonTags(it, prevLabel)}</div>` : ''}
+    ${spark || trend ? `<div class="trend">${spark}${trend}</div>` : ''}
+    <a class="btn" href="${esc(href)}" target="_blank" rel="${AFF_REL}">楽天市場で見る</a>
   </div>
 </li>`;
+}
+
+// 注目商品・急上昇などの小さな一覧
+function miniList(items, { prevLabel, genre }) {
+  return `<ul class="minis">${items.map((it) => {
+    const href = it.aff || it.url;
+    const img = sized(it.img, 64);
+    const where = genre ? `<span class="where">${esc(genre.name)}</span>` : '';
+    return `<li class="mini">
+  <a class="mthumb" href="${esc(href)}" target="_blank" rel="${AFF_REL}">${img ? `<img src="${esc(img)}" alt="${esc(clip(it.name, 30))}" loading="lazy" width="56" height="56">` : ''}</a>
+  <div class="mbody"><span class="mrank">${it.rank}位</span>${deltaBadge(it)}${where}
+    <a class="mname" href="${esc(href)}" target="_blank" rel="${AFF_REL}">${esc(clip(it.name, 56))}</a>
+    <span class="mprice">${yen(it.price)}${priceNote(it, prevLabel)}</span>${reasonTags(it, prevLabel)}</div>
+</li>`;
+  }).join('\n')}</ul>`;
 }
 
 const CSS = `
@@ -235,6 +406,9 @@ a{color:inherit}.wrap{max-width:860px;margin:0 auto;padding:0 16px}
 .header{background:var(--red);color:#fff}.header .wrap{padding:12px 16px}.logo{font-weight:700;font-size:18px;text-decoration:none}
 h1{font-size:22px;margin:24px 0 4px}h2{font-size:17px;margin:32px 0 10px;border-left:4px solid var(--red);padding-left:10px}
 .lead{color:var(--sub);margin:0 0 16px;font-size:13px}
+.stale{background:#fff1f0;border:1px solid #ffccc7;color:#a8071a;border-radius:8px;padding:8px 12px;font-size:13px;margin:12px 0}
+.note{background:#f0f7ff;border:1px solid #cfe3f7;color:#26527a;border-radius:8px;padding:8px 12px;font-size:13px;margin:12px 0}
+.trendbox{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:14px;margin:0 0 8px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.chip{background:#fff;border:1px solid var(--line);border-radius:999px;padding:4px 12px;font-size:13px;text-decoration:none}.chip.on{background:var(--red);color:#fff;border-color:var(--red)}
 .grp{margin:8px 0}.grp-name{font-size:12px;color:var(--sub);font-weight:600}.grp .chips{margin:4px 0 8px}
 .list{list-style:none;margin:0;padding:0;display:grid;gap:10px}
@@ -242,14 +416,20 @@ h1{font-size:22px;margin:24px 0 4px}h2{font-size:17px;margin:32px 0 10px;border-
 .item.norank{grid-template-columns:120px 1fr}
 .rank{text-align:center;font-size:12px;color:var(--sub)}.rank b{display:block;font-size:24px;line-height:1.1;color:var(--fg)}
 .rank.r1 b{color:#c9a100}.rank.r2 b{color:#8a8f98}.rank.r3 b{color:#b06a2c}
-.delta{display:block;font-size:11px;font-weight:700;margin-top:2px}.delta.up{color:var(--up)}.delta.down{color:var(--down)}.delta.flat{color:#aaa}.delta.new{color:#fff;background:var(--red);border-radius:4px;padding:0 4px;display:inline-block}
+.delta{display:inline-block;font-size:11px;font-weight:700;margin:2px 0 0 4px}.rank .delta{display:block;margin-left:0}.delta.up{color:var(--up)}.delta.down{color:var(--down)}.delta.flat{color:#aaa}.delta.new{color:#fff;background:var(--red);border-radius:4px;padding:0 4px}
 .thumb{display:block;width:120px;height:120px;background:#fafafa;border-radius:6px;overflow:hidden}.thumb img{width:100%;height:100%;object-fit:contain}.noimg{display:grid;place-items:center;height:100%;color:#bbb;font-size:12px}
 .name{font-weight:600;text-decoration:none;display:block;margin-bottom:4px}.name:hover{text-decoration:underline}
 .price{font-size:18px;font-weight:700;color:var(--red)}.pdiff{font-size:12px;font-weight:400;margin-left:8px}.pdiff.cut{color:var(--down)}.pdiff.rise{color:var(--up)}
-.meta{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;font-size:12px;color:var(--sub);margin:4px 0 8px}.review{color:#e08a00;font-weight:600}.review small{color:var(--sub);font-weight:400}
-.tag{border:1px solid #f0b4b4;color:var(--red);border-radius:4px;padding:0 5px}
+.meta{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;font-size:12px;color:var(--sub);margin:4px 0 6px}.review{color:#e08a00;font-weight:600}.review small{color:var(--sub);font-weight:400}
+.tags{display:flex;flex-wrap:wrap;gap:4px;margin:2px 0 6px}
+.tag{border:1px solid #f0b4b4;color:var(--red);border-radius:4px;padding:0 5px;font-size:12px}.tag.hot{background:var(--red);border-color:var(--red);color:#fff}.tag.sale{border-color:#9cc7ee;color:var(--down)}
+.trend{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--sub);margin:0 0 8px}
+.spark{stroke:#999;fill:#999}.spark.up{stroke:var(--up);fill:var(--up)}.spark.down{stroke:var(--down);fill:var(--down)}
 .btn{display:inline-block;background:var(--red);color:#fff;text-decoration:none;border-radius:6px;padding:6px 16px;font-size:13px;font-weight:600}
-.top5{display:grid;gap:8px;margin:0 0 8px;padding:0;list-style:none}.top5 li{background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px 12px;display:flex;gap:10px;align-items:baseline}.top5 b{min-width:2em}
+.minis{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.mini{display:flex;gap:10px;background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px}
+.mthumb{flex:none;width:56px;height:56px;background:#fafafa;border-radius:4px;overflow:hidden}.mthumb img{width:100%;height:100%;object-fit:contain}
+.mbody{font-size:13px;display:flex;flex-wrap:wrap;gap:2px 8px;align-items:baseline}.mrank{font-weight:700}.mname{flex-basis:100%;text-decoration:none;font-weight:600}.mprice{color:var(--red);font-weight:700}.where{font-size:11px;color:var(--sub);border:1px solid var(--line);border-radius:4px;padding:0 4px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.panel{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px}.panel h3{margin:0 0 6px;font-size:15px}.panel a.more{font-size:12px}
 .panel ol{margin:0;padding-left:1.4em;font-size:13px}.panel li{margin:2px 0}
 .footer{margin-top:40px;border-top:1px solid var(--line);padding:16px 0 40px;font-size:12px;color:var(--sub)}
@@ -262,65 +442,53 @@ async function main() {
   if (!MOCK && (!APP_ID || !ACCESS_KEY)) {
     throw new Error('RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY が未設定です (テスト時は MOCK=1)');
   }
+  const mockFail = new Set((process.env.MOCK_FAIL ?? '').split(',').filter(Boolean));
 
-  const dates = await loadHistoryDates();
-  const prevDate = [...dates].reverse().find((d) => d < TODAY);
-  const prevHistory = prevDate ? await loadHistory(prevDate) : null;
-  if (prevDate) console.log(`前日比の比較対象: ${prevDate}`);
-
+  const hist = await buildHistoryIndex();
   await mkdir(path.join(DATA, 'latest'), { recursive: true });
   await mkdir(path.join(DATA, 'history'), { recursive: true });
 
-  const result = {}; // slug -> items
-  let okCount = 0;
-
+  // ---- 取得
+  const R = {}; // slug -> { items, fresh, dataDate, meta }
   for (const [i, g] of genres.entries()) {
-    let items = null;
     try {
-      items = MOCK ? mockRanking(g) : await fetchRanking(g);
+      if (MOCK && mockFail.has(g.slug)) throw new Error('(テスト)取得失敗を再現');
+      const items = MOCK ? mockRanking(g) : await fetchRanking(g);
       if (items.length < 3) throw new Error(`取得件数が少なすぎます(${items.length}件)`);
-      okCount++;
+      R[g.slug] = { items, fresh: true, dataDate: TODAY };
       console.log(`✓ ${g.name}: ${items.length}件`);
     } catch (e) {
       console.error(`✗ ${g.name}: ${e.message}`);
-      const fallback = path.join(DATA, 'latest', `${g.slug}.json`);
-      if (existsSync(fallback)) {
-        items = JSON.parse(await readFile(fallback, 'utf8')).items;
-        console.warn(`  → 前回のデータを使用します`);
+      const fb = path.join(DATA, 'latest', `${g.slug}.json`);
+      if (existsSync(fb)) {
+        const saved = JSON.parse(await readFile(fb, 'utf8'));
+        R[g.slug] = { items: saved.items, fresh: false, dataDate: saved.date ?? '' };
+        console.warn(`  → ${saved.date ?? '日付不明'}のデータを「古いデータ」として表示します`);
       }
     }
-    if (items) result[g.slug] = items;
-    if (!MOCK && i < genres.length - 1) await sleep(1200); // APIへの負荷配慮(1秒に1回程度)
+    if (!MOCK && i < genres.length - 1) await sleep(1200); // APIへの負荷配慮
   }
+  const freshCount = Object.values(R).filter((r) => r.fresh).length;
+  if (freshCount === 0) throw new Error('全ジャンルの取得に失敗したため中断します');
 
-  if (okCount === 0) throw new Error('全ジャンルの取得に失敗したため中断します');
-
-  // 前日比の計算
+  // ---- 分析
   for (const g of genres) {
-    const items = result[g.slug];
-    if (!items) continue;
-    const prev = new Map((prevHistory?.genres?.[g.slug] ?? []).map(([c, r, p]) => [c, { r, p }]));
-    for (const it of items) {
-      const p = prev.get(it.code);
-      it.hasPrev = prev.size > 0;
-      it.isNew = prev.size > 0 && !p;
-      it.delta = p ? p.r - it.rank : 0;
-      it.priceDiff = p && p.p ? it.price - p.p : 0;
-    }
+    const r = R[g.slug];
+    if (!r) continue;
+    if (r.fresh) r.meta = enrich(g.slug, r.items, hist);
+    else { markStale(r.items); r.meta = { prevDate: null, prevLabel: '', hasPrev: false }; }
   }
 
-  // データ保存(履歴は軽量形式)
-  if (okCount > 0) {
-    const hist = { date: TODAY, genres: {} };
-    for (const g of genres) {
-      const items = result[g.slug];
-      if (!items) continue;
-      hist.genres[g.slug] = items.map((it) => [it.code, it.rank, it.price]);
-      await writeFile(path.join(DATA, 'latest', `${g.slug}.json`),
-        JSON.stringify({ updated: NOW_LABEL, items }, null, 1));
-    }
-    await writeFile(path.join(DATA, 'history', `${TODAY}.json`), JSON.stringify(hist));
+  // ---- 保存(取得成功したジャンルのみ。古いデータで履歴や最新データを上書きしない)
+  const today = { date: TODAY, genres: {} };
+  for (const g of genres) {
+    const r = R[g.slug];
+    if (!r?.fresh) continue;
+    today.genres[g.slug] = r.items.map((it) => [it.code, it.rank, it.price]);
+    await writeFile(path.join(DATA, 'latest', `${g.slug}.json`),
+      JSON.stringify({ date: TODAY, updated: NOW_LABEL, items: r.items.map(toRaw) }, null, 1));
   }
+  await writeFile(path.join(DATA, 'history', `${TODAY}.json`), JSON.stringify(today));
 
   // ---- サイト生成
   await rm(DIST, { recursive: true, force: true });
@@ -329,74 +497,114 @@ async function main() {
   await writeFile(path.join(DIST, 'robots.txt'),
     `User-agent: *\nAllow: /\nSitemap: ${site.baseUrl}/sitemap.xml\n`);
 
-  // 急上昇(前日から10位以上アップ、またはNEW上位)
+  const live = genres.filter((g) => R[g.slug]);
+  const urls = [{ loc: `${site.baseUrl}/`, lastmod: TODAY }];
+
+  // トップページ: 急上昇ピックアップ(最新データのジャンルのみ)
   const movers = [];
-  for (const g of genres) {
-    for (const it of result[g.slug] ?? []) {
-      if (it.delta >= 10) movers.push({ ...it, genre: g });
-    }
+  for (const g of live) {
+    if (!R[g.slug].fresh) continue;
+    for (const it of R[g.slug].items) if (it.delta >= 10) movers.push({ ...it, _g: g, _label: R[g.slug].meta.prevLabel });
   }
   movers.sort((a, b) => b.delta - a.delta);
-  const topMovers = movers.slice(0, 10);
-
-  // トップページ
-  const panels = genres.filter((g) => result[g.slug]).map((g) => {
-    const top = result[g.slug].slice(0, 5)
-      .map((it) => `<li>${esc(clip(it.name, 28))}</li>`).join('');
-    return `<section class="panel"><h3>${esc(g.name)}</h3><ol>${top}</ol><a class="more" href="${g.slug}/">ランキングをもっと見る →</a></section>`;
-  }).join('');
-
-  const moverHtml = topMovers.length
-    ? `<h2>急上昇ピックアップ</h2><p class="lead">前日から10位以上順位を上げた商品です。</p><ul class="list">${
-      topMovers.map((it) => card(it, { showRank: false })).join('\n')}</ul>`
+  const moverHtml = movers.length
+    ? `<h2>今、急上昇している商品</h2><p class="lead">前日などから10位以上順位を上げた商品です。</p><ul class="minis">${
+      movers.slice(0, 10).map((it) => miniList([it], { prevLabel: it._label, genre: it._g }).replace(/^<ul class="minis">|<\/ul>$/g, '')).join('\n')}</ul>`
     : '';
 
+  const panels = live.map((g) => {
+    const top = R[g.slug].items.slice(0, 5).map((it) => `<li>${esc(clip(it.name, 28))}</li>`).join('');
+    return `<section class="panel"><h3>${esc(g.name)}</h3><ol>${top}</ol><a class="more" href="${g.slug}/">${esc(g.name)}ランキングをもっと見る →</a></section>`;
+  }).join('');
+
   await writeFile(path.join(DIST, 'index.html'), layout({
-    title: `${site.name} | 楽天市場のジャンル別ランキング(毎日更新)`,
+    title: `${site.name}｜楽天市場の売れ筋・急上昇商品をジャンル別に毎日更新`,
     description: site.description,
     canonical: `${site.baseUrl}/`,
     depth: 0,
+    jsonLd: [{ '@context': 'https://schema.org', '@type': 'WebSite', name: site.name, url: `${site.baseUrl}/` }],
     body: `<h1>${esc(site.name)}</h1>
 <p class="lead">${esc(site.description)}(${esc(NOW_LABEL)} 更新)</p>
-${nav(null)}
+${allGenresNav('')}
 ${moverHtml}
 <h2>ジャンル別ランキング</h2>
 <div class="grid">${panels}</div>`,
   }));
 
   // ジャンル別ページ
-  const urls = [`${site.baseUrl}/`];
-  for (const g of genres) {
-    const items = result[g.slug];
-    if (!items) continue;
+  for (const g of live) {
+    const r = R[g.slug];
+    const { items, meta } = r;
+    const stale = !r.fresh;
+    const label = meta.prevLabel || '前日';
+    const dateLabel = stale ? fmtMD(r.dataDate || TODAY) : fmtMD(TODAY);
+
+    const rising = pickRising(items), fresh = pickNew(items), cuts = pickCuts(items);
+    const cnt = { up: items.filter((i) => i.delta >= 5).length, nw: items.filter((i) => i.isNew).length, cut: cuts.length };
+
+    const section = (title, list, desc) => (list.length
+      ? `<h2>${title}</h2><p class="lead">${desc}</p>${miniList(list, { prevLabel: label })}` : '');
+
+    const staleBanner = stale
+      ? `<p class="stale">※このジャンルは最新データの取得に失敗したため、<b>${esc(r.dataDate ? fmtMD(r.dataDate) : '過去')}時点</b>の情報を表示しています。順位・価格は現在と異なる場合があります。変動情報は表示していません。</p>` : '';
+    const histNote = !stale && !meta.hasPrev
+      ? '<p class="note">順位の変動・価格の変化・7日間の推移は、データが溜まる2日目以降に表示されます。</p>' : '';
+
+    const body = `<h1>楽天市場 ${esc(g.name)}ランキング</h1>
+<p class="lead">${esc(g.name)}ジャンルのリアルタイムランキング TOP${items.length}。${esc(dateLabel)}${stale ? '時点のデータです。' : `(${esc(NOW_LABEL)})に更新しました。`}</p>
+${staleBanner}${histNote}
+${sameGroupNav(g.slug)}
+<h2>${stale ? '注目商品' : '今日の注目商品'} TOP${Math.min(5, items.length)}</h2>
+<p class="lead">順位に加えて、${stale ? '' : '急上昇・新着・値下がり・連続ランクインを加味して'}選んでいます。</p>
+${miniList(pickHighlights(items), { prevLabel: label })}
+${stale ? '' : section('急上昇した商品', rising, `${esc(label)}から5位以上順位を上げた商品です。`)}
+${stale ? '' : section('新しくランクインした商品', fresh, `${esc(label)}はTOP${items.length}圏外だった商品です。`)}
+${stale ? '' : section('価格が下がった商品', cuts, `${esc(label)}より価格が下がった商品です(下落率の大きい順)。`)}
+<h2>${esc(g.name)}ランキングの傾向</h2>
+<div class="trendbox">${esc(trendText(g, items, meta, stale))}</div>
+<h2>${esc(g.name)}ランキング TOP${items.length}</h2>
+<p class="lead">矢印は${esc(label)}比の順位変動、折れ線は直近${TREND_DAYS}日の順位推移(上ほど上位)です。</p>
+<ul class="list">${items.map((it) => card(it, { prevLabel: label })).join('\n')}</ul>
+<h2>ほかのジャンルのランキング</h2>
+${allGenresNav('../', g.slug)}`;
+
+    const descParts = [`楽天市場の${g.name}ジャンルで今売れている商品TOP${items.length}。`];
+    if (!stale && meta.hasPrev) {
+      descParts.push(`急上昇${cnt.up}件・新着ランクイン${cnt.nw}件・値下がり${cnt.cut}件。`);
+    }
+    descParts.push(`毎日更新(${dateLabel}${stale ? '時点' : '更新'})。`);
+
     await mkdir(path.join(DIST, g.slug), { recursive: true });
-    const jsonLd = {
-      '@context': 'https://schema.org',
-      '@type': 'ItemList',
-      name: `楽天市場 ${g.name} ランキング`,
-      itemListElement: items.slice(0, 10).map((it) => ({
-        '@type': 'ListItem', position: it.rank, name: it.name,
-      })),
-    };
     await writeFile(path.join(DIST, g.slug, 'index.html'), layout({
-      title: `【${TODAY.replace(/-/g, '/')}】楽天市場 ${g.name}ランキング TOP${items.length} | ${site.name}`,
-      description: `楽天市場の${g.name}ジャンルの人気ランキングTOP${items.length}。前日からの順位変動と価格をまとめています。(${NOW_LABEL} 更新)`,
+      title: `楽天${g.name}ランキング｜売れ筋・急上昇商品を毎日更新`,
+      description: descParts.join(''),
       canonical: `${site.baseUrl}/${g.slug}/`,
       depth: 1,
-      jsonLd,
-      body: `<h1>楽天市場 ${esc(g.name)}ランキング</h1>
-<p class="lead">リアルタイムランキング TOP${items.length}(${esc(NOW_LABEL)} 更新)。矢印は前日比の順位変動です。</p>
-${nav(g.slug)}
-<ul class="list">${items.map((it) => card(it)).join('\n')}</ul>`,
+      jsonLd: [
+        {
+          '@context': 'https://schema.org', '@type': 'BreadcrumbList',
+          itemListElement: [
+            { '@type': 'ListItem', position: 1, name: site.name, item: `${site.baseUrl}/` },
+            { '@type': 'ListItem', position: 2, name: `${g.name}ランキング`, item: `${site.baseUrl}/${g.slug}/` },
+          ],
+        },
+        {
+          '@context': 'https://schema.org', '@type': 'ItemList',
+          name: `楽天市場 ${g.name}ランキング`,
+          itemListElement: items.slice(0, 10).map((it) => ({ '@type': 'ListItem', position: it.rank, name: it.name })),
+        },
+      ],
+      body,
     }));
-    urls.push(`${site.baseUrl}/${g.slug}/`);
+    urls.push({ loc: `${site.baseUrl}/${g.slug}/`, lastmod: stale && r.dataDate ? r.dataDate : TODAY });
   }
 
   const sitemap = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${
-    urls.map((u) => `  <url><loc>${u}</loc><lastmod>${TODAY}</lastmod></url>`).join('\n')}\n</urlset>\n`;
+    urls.map((u) => `  <url><loc>${u.loc}</loc><lastmod>${u.lastmod}</lastmod></url>`).join('\n')}\n</urlset>\n`;
   await writeFile(path.join(DIST, 'sitemap.xml'), sitemap);
 
-  console.log(`完了: ${okCount}/${genres.length}ジャンル → dist/ (${urls.length}ページ)`);
+  const staleCount = live.length - freshCount;
+  console.log(`完了: 最新${freshCount}ジャンル${staleCount ? ` / 古いデータ${staleCount}ジャンル` : ''} → dist/ (${urls.length}ページ)`);
 }
 
 main().catch((e) => {
